@@ -2,6 +2,8 @@ import type { Express } from "express";
 import { storage } from "./storage";
 import { insertEmployeeSchema, insertPayrollRunSchema } from "@shared/schema";
 import { isWithinGeofence, haversineDistance } from "./utils";
+import { calculatePayrollForPeriod } from "./payroll-calculator";
+import { generatePayrollCSV, generatePayrollIIF } from "./export-utils";
 
 export function registerRoutes(app: Express) {
 
@@ -599,8 +601,270 @@ export function registerRoutes(app: Express) {
     }
   });
 
+  // ── PAYROLL PERIODS ───────────────────────────────────────────────────────
+
+  // GET /api/payroll/periods — list all periods
+  app.get("/api/payroll/periods", async (req, res) => {
+    try {
+      const { status, sortBy, sortOrder } = req.query;
+      const periods = await storage.getPayrollPeriods({
+        status: status as string | undefined,
+        sortBy: sortBy as string | undefined,
+        sortOrder: sortOrder as string | undefined,
+      });
+      res.json({ data: periods });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch payroll periods", code: "FETCH_ERROR" });
+    }
+  });
+
+  // POST /api/payroll/periods — create period (before /:id)
+  app.post("/api/payroll/periods", async (req, res) => {
+    try {
+      const { periodStart, periodEnd, notes } = req.body;
+      if (!periodStart || !periodEnd) {
+        return res.status(400).json({ error: "periodStart and periodEnd are required", code: "VALIDATION_ERROR" });
+      }
+      if (periodEnd <= periodStart) {
+        return res.status(400).json({ error: "periodEnd must be after periodStart", code: "VALIDATION_ERROR" });
+      }
+      const days = (new Date(periodEnd).getTime() - new Date(periodStart).getTime()) / 86400000;
+      if (days > 31) {
+        return res.status(400).json({ error: "Pay period cannot exceed 31 days", code: "VALIDATION_ERROR" });
+      }
+      const overlap = await storage.checkPayrollPeriodOverlap(periodStart, periodEnd);
+      if (overlap) {
+        return res.status(409).json({ error: "This period overlaps with an existing pay period", code: "OVERLAP_ERROR" });
+      }
+      const period = await storage.createPayrollPeriod({
+        periodStart,
+        periodEnd,
+        status: "open",
+        notes: notes ?? null,
+        totalRegularHours: "0.00",
+        totalOvertimeHours: "0.00",
+        totalDoubleTimeHours: "0.00",
+        totalGrossPay: "0.00",
+        totalEmployees: 0,
+      });
+      res.status(201).json({ data: period });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to create payroll period", code: "CREATE_ERROR" });
+    }
+  });
+
+  // GET /api/payroll/periods/:id — period with entries and unapproved count
+  app.get("/api/payroll/periods/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const period = await storage.getPayrollPeriodById(id);
+      if (!period) return res.status(404).json({ error: "Period not found", code: "NOT_FOUND" });
+
+      const rawEntries = await storage.getPayrollEntries(id);
+
+      // Join employee names + department
+      const empsResult = await storage.getEmployees({ limit: 500 });
+      const empMap = new Map(empsResult.data.map(e => [e.id, e]));
+      const entries = rawEntries.map(e => {
+        const emp = empMap.get(e.employeeId);
+        return {
+          ...e,
+          employeeName: emp ? `${emp.firstName} ${emp.lastName}` : "Unknown",
+          department: emp?.department ?? "",
+        };
+      });
+
+      // Count unapproved entries in the period
+      const { data: allEntries } = await storage.getTimeEntries({
+        dateFrom: period.periodStart,
+        dateTo: period.periodEnd,
+        limit: 1000,
+      });
+      const unapprovedCount = allEntries.filter(e => e.status === "pending" || e.status === "active").length;
+
+      res.json({ data: { ...period, entries, unapprovedCount } });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch payroll period", code: "FETCH_ERROR" });
+    }
+  });
+
+  // POST /api/payroll/periods/:id/calculate
+  app.post("/api/payroll/periods/:id/calculate", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const { userId } = req.body;
+      const period = await storage.getPayrollPeriodById(id);
+      if (!period) return res.status(404).json({ error: "Period not found", code: "NOT_FOUND" });
+      if (period.status === "approved" || period.status === "exported" || period.status === "closed") {
+        return res.status(400).json({ error: `Cannot recalculate a ${period.status} period`, code: "INVALID_STATE" });
+      }
+
+      const { entries: calcEntries, warnings } = await calculatePayrollForPeriod(id, userId ?? 1);
+
+      // Refresh period after update
+      const updatedPeriod = await storage.getPayrollPeriodById(id);
+
+      // Comparison to previous period
+      const allPeriods = await storage.getPayrollPeriods({ sortOrder: "desc" });
+      const prevPeriod = allPeriods.find(p =>
+        p.id !== id &&
+        p.periodEnd < period.periodStart &&
+        ["calculated", "approved", "exported", "closed"].includes(p.status)
+      );
+
+      const totGross = parseFloat(updatedPeriod!.totalGrossPay);
+      const comparisonToPreviousPeriod = prevPeriod ? {
+        previousPeriodId: prevPeriod.id,
+        previousGrossPay: prevPeriod.totalGrossPay,
+        difference: (totGross - parseFloat(prevPeriod.totalGrossPay)).toFixed(2),
+        percentChange: parseFloat(prevPeriod.totalGrossPay) > 0
+          ? (((totGross - parseFloat(prevPeriod.totalGrossPay)) / parseFloat(prevPeriod.totalGrossPay)) * 100).toFixed(1)
+          : null,
+      } : null;
+
+      res.json({
+        data: {
+          period: updatedPeriod,
+          entries: calcEntries,
+          summary: {
+            totals: {
+              employees: calcEntries.length,
+              regularHours: updatedPeriod!.totalRegularHours,
+              overtimeHours: updatedPeriod!.totalOvertimeHours,
+              doubleTimeHours: updatedPeriod!.totalDoubleTimeHours,
+              grossPay: updatedPeriod!.totalGrossPay,
+            },
+            warnings,
+            comparisonToPreviousPeriod,
+          },
+        },
+      });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Calculation failed";
+      res.status(500).json({ error: msg, code: "CALCULATE_ERROR" });
+    }
+  });
+
+  // POST /api/payroll/periods/:id/approve — requires confirmation="APPROVE"
+  app.post("/api/payroll/periods/:id/approve", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const { userId, confirmation } = req.body;
+      if (confirmation !== "APPROVE") {
+        return res.status(400).json({ error: "Must type APPROVE to confirm", code: "CONFIRMATION_REQUIRED" });
+      }
+      const period = await storage.getPayrollPeriodById(id);
+      if (!period) return res.status(404).json({ error: "Period not found", code: "NOT_FOUND" });
+      if (period.status !== "calculated") {
+        return res.status(400).json({ error: "Period must be in calculated status to approve", code: "INVALID_STATE" });
+      }
+      const ts = new Date().toISOString();
+      const updated = await storage.updatePayrollPeriod(id, {
+        status: "approved",
+        processedBy: userId ?? null,
+        processedAt: ts,
+      });
+      await storage.createAuditLog({
+        action: "approve",
+        tableName: "payroll_periods",
+        recordId: id,
+        previousValues: JSON.stringify({ status: "calculated" }),
+        newValues: JSON.stringify({ status: "approved" }),
+        userId: userId ?? null,
+        userDisplayName: null,
+      });
+      res.json({ data: updated });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to approve payroll", code: "APPROVE_ERROR" });
+    }
+  });
+
+  // GET /api/payroll/periods/:id/export/csv
+  app.get("/api/payroll/periods/:id/export/csv", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const period = await storage.getPayrollPeriodById(id);
+      if (!period) return res.status(404).json({ error: "Period not found", code: "NOT_FOUND" });
+
+      const rawEntries = await storage.getPayrollEntries(id);
+      const empsResult = await storage.getEmployees({ limit: 500 });
+      const empMap = new Map(empsResult.data.map(e => [e.id, e]));
+      const entries = rawEntries.map(e => {
+        const emp = empMap.get(e.employeeId);
+        return { ...e, employeeName: emp ? `${emp.firstName} ${emp.lastName}` : "Unknown", department: emp?.department ?? "" };
+      });
+
+      const csv = generatePayrollCSV(period, entries);
+      const filename = `payroll-${period.periodStart}-${period.periodEnd}.csv`;
+
+      // Mark exported if approved
+      if (period.status === "approved") {
+        await storage.updatePayrollPeriod(id, { status: "exported", exportedAt: new Date().toISOString() });
+      }
+
+      res.setHeader("Content-Type", "text/csv");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      res.send(csv);
+    } catch (error) {
+      res.status(500).json({ error: "Export failed", code: "EXPORT_ERROR" });
+    }
+  });
+
+  // GET /api/payroll/periods/:id/export/iif
+  app.get("/api/payroll/periods/:id/export/iif", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const period = await storage.getPayrollPeriodById(id);
+      if (!period) return res.status(404).json({ error: "Period not found", code: "NOT_FOUND" });
+
+      const rawEntries = await storage.getPayrollEntries(id);
+      const empsResult = await storage.getEmployees({ limit: 500 });
+      const empMap = new Map(empsResult.data.map(e => [e.id, e]));
+      const entries = rawEntries.map(e => {
+        const emp = empMap.get(e.employeeId);
+        return { ...e, employeeName: emp ? `${emp.firstName} ${emp.lastName}` : "Unknown", department: emp?.department ?? "" };
+      });
+
+      const { data: timeEntries } = await storage.getTimeEntries({
+        dateFrom: period.periodStart,
+        dateTo: period.periodEnd,
+        status: "approved",
+        limit: 1000,
+      });
+
+      const iif = generatePayrollIIF(period, entries, timeEntries);
+      const filename = `payroll-${period.periodStart}-${period.periodEnd}.iif`;
+
+      if (period.status === "approved") {
+        await storage.updatePayrollPeriod(id, { status: "exported", exportedAt: new Date().toISOString() });
+      }
+
+      res.setHeader("Content-Type", "text/plain");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      res.send(iif);
+    } catch (error) {
+      res.status(500).json({ error: "Export failed", code: "EXPORT_ERROR" });
+    }
+  });
+
+  // POST /api/payroll/periods/:id/close
+  app.post("/api/payroll/periods/:id/close", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const period = await storage.getPayrollPeriodById(id);
+      if (!period) return res.status(404).json({ error: "Period not found", code: "NOT_FOUND" });
+      if (period.status !== "exported") {
+        return res.status(400).json({ error: "Period must be exported before closing", code: "INVALID_STATE" });
+      }
+      const updated = await storage.updatePayrollPeriod(id, { status: "closed" });
+      res.json({ data: updated });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to close period", code: "CLOSE_ERROR" });
+    }
+  });
+
   // ── PAYROLL (legacy) ──────────────────────────────────────────────────────
-  app.get("/api/payroll-runs", async (req, res) => {
+  app.get("/api/payroll-runs", async (_req, res) => {
     try {
       const data = await storage.getPayrollRuns();
       res.json({ data });
