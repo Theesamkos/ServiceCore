@@ -863,6 +863,696 @@ export function registerRoutes(app: Express) {
     }
   });
 
+  // ── JOB COSTING ───────────────────────────────────────────────────────────
+
+  // GET /api/jobs/costing-summary (specific, before any /:id route)
+  app.get("/api/jobs/costing-summary", async (req, res) => {
+    try {
+      const { dateFrom, dateTo, groupBy } = req.query;
+      const result = await storage.getJobs({
+        dateFrom: dateFrom as string | undefined,
+        dateTo: dateTo as string | undefined,
+        limit: 2000,
+      });
+      const jobs = result.data;
+
+      const totalRevenue = jobs.reduce((s, j) => s + parseFloat(j.revenue ?? "0"), 0);
+      const totalLaborCost = jobs.reduce((s, j) => s + parseFloat(j.laborCost ?? "0"), 0);
+      const overallMargin = totalRevenue > 0 ? (totalRevenue - totalLaborCost) / totalRevenue * 100 : 0;
+      const unprofitableJobs = jobs.filter(j => parseFloat(j.laborCost ?? "0") > parseFloat(j.revenue ?? "0")).length;
+
+      type BI = { name: string; revenue: string; laborCost: string; grossProfit: string; margin: string; jobCount: number };
+      const breakdown: BI[] = [];
+
+      if (groupBy === "serviceType" || groupBy === "customer") {
+        const gmap = new Map<string, typeof jobs>();
+        for (const job of jobs) {
+          const k = groupBy === "serviceType" ? job.serviceType : job.customerName;
+          const arr = gmap.get(k) ?? [];
+          arr.push(job);
+          gmap.set(k, arr);
+        }
+        for (const [name, grp] of gmap) {
+          const rev = grp.reduce((s, j) => s + parseFloat(j.revenue ?? "0"), 0);
+          const cost = grp.reduce((s, j) => s + parseFloat(j.laborCost ?? "0"), 0);
+          const profit = rev - cost;
+          breakdown.push({ name, revenue: rev.toFixed(2), laborCost: cost.toFixed(2), grossProfit: profit.toFixed(2), margin: rev > 0 ? ((profit / rev) * 100).toFixed(1) : "0.0", jobCount: grp.length });
+        }
+        breakdown.sort((a, b) => parseFloat(b.revenue) - parseFloat(a.revenue));
+      } else if (groupBy === "route") {
+        const gmap = new Map<number | null, typeof jobs>();
+        for (const job of jobs) {
+          const arr = gmap.get(job.routeId) ?? [];
+          arr.push(job);
+          gmap.set(job.routeId, arr);
+        }
+        const routeNames = new Map<number, string>();
+        await Promise.all([...gmap.keys()].filter(k => k !== null).map(async rid => {
+          const r = await storage.getRouteById(rid as number);
+          if (r) routeNames.set(rid as number, r.name);
+        }));
+        for (const [routeId, grp] of gmap) {
+          const name = routeId ? routeNames.get(routeId) ?? `Route ${routeId}` : "No Route";
+          const rev = grp.reduce((s, j) => s + parseFloat(j.revenue ?? "0"), 0);
+          const cost = grp.reduce((s, j) => s + parseFloat(j.laborCost ?? "0"), 0);
+          const profit = rev - cost;
+          breakdown.push({ name, revenue: rev.toFixed(2), laborCost: cost.toFixed(2), grossProfit: profit.toFixed(2), margin: rev > 0 ? ((profit / rev) * 100).toFixed(1) : "0.0", jobCount: grp.length });
+        }
+        breakdown.sort((a, b) => parseFloat(b.revenue) - parseFloat(a.revenue));
+      }
+
+      res.json({ data: { totalRevenue: totalRevenue.toFixed(2), totalLaborCost: totalLaborCost.toFixed(2), overallMargin: overallMargin.toFixed(1), totalJobs: jobs.length, unprofitableJobs, breakdown } });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch costing summary", code: "FETCH_ERROR" });
+    }
+  });
+
+  // GET /api/jobs
+  app.get("/api/jobs", async (req, res) => {
+    try {
+      const { dateFrom, dateTo, serviceType, routeId, customerName, profitability, page, limit } = req.query;
+      const pageNum = page ? parseInt(page as string) : 1;
+      const limitNum = limit ? parseInt(limit as string) : 25;
+      const result = await storage.getJobs({
+        dateFrom: dateFrom as string | undefined,
+        dateTo: dateTo as string | undefined,
+        serviceType: serviceType as string | undefined,
+        routeId: routeId ? parseInt(routeId as string) : undefined,
+        customerName: customerName as string | undefined,
+        page: pageNum,
+        limit: limitNum,
+      });
+
+      const routeIds = [...new Set(result.data.filter(j => j.routeId).map(j => j.routeId!))];
+      const routeMap = new Map<number, { name: string; assignedDriverId: number | null }>();
+      await Promise.all(routeIds.map(async rid => {
+        const r = await storage.getRouteById(rid);
+        if (r) routeMap.set(rid, { name: r.name, assignedDriverId: r.assignedDriverId });
+      }));
+      const driverIds = [...new Set([...routeMap.values()].filter(r => r.assignedDriverId).map(r => r.assignedDriverId!))];
+      const driverMap = new Map<number, string>();
+      await Promise.all(driverIds.map(async did => {
+        const e = await storage.getEmployeeById(did);
+        if (e) driverMap.set(did, `${e.firstName} ${e.lastName}`);
+      }));
+
+      let data = result.data.map(job => {
+        const route = job.routeId ? routeMap.get(job.routeId) : null;
+        const rev = parseFloat(job.revenue ?? "0");
+        const labor = parseFloat(job.laborCost ?? "0");
+        const margin = rev > 0 ? ((rev - labor) / rev * 100).toFixed(1) : null;
+        return { ...job, routeName: route?.name ?? null, driverName: route?.assignedDriverId ? driverMap.get(route.assignedDriverId) ?? null : null, margin };
+      });
+
+      if (profitability === "profitable") data = data.filter(j => j.margin !== null && parseFloat(j.margin) > 0);
+      if (profitability === "unprofitable") data = data.filter(j => j.margin === null || parseFloat(j.margin) <= 0);
+
+      res.json({ data, pagination: { page: pageNum, limit: limitNum, total: result.total, totalPages: Math.ceil(result.total / limitNum) } });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch jobs", code: "FETCH_ERROR" });
+    }
+  });
+
+  // POST /api/jobs
+  app.post("/api/jobs", async (req, res) => {
+    try {
+      const { jobNumber, customerName, address, serviceType, scheduledDate, revenue, laborCost, materialCost, routeId, status, notes, customerPhone, scheduledTime } = req.body;
+      if (!jobNumber || !customerName || !address || !scheduledDate) {
+        return res.status(400).json({ error: "jobNumber, customerName, address, scheduledDate required", code: "VALIDATION_ERROR" });
+      }
+      const rev = parseFloat(revenue ?? "0");
+      const labor = parseFloat(laborCost ?? "0");
+      const mat = parseFloat(materialCost ?? "0");
+      const job = await storage.createJob({
+        jobNumber, customerName, customerPhone: customerPhone ?? null, address,
+        serviceType: serviceType ?? "service", routeId: routeId ? parseInt(routeId) : null,
+        scheduledDate, scheduledTime: scheduledTime ?? null,
+        revenue: rev.toFixed(2), laborCost: labor.toFixed(2), materialCost: mat.toFixed(2),
+        grossProfit: (rev - labor - mat).toFixed(2), status: status ?? "scheduled", notes: notes ?? null,
+      });
+      res.status(201).json({ data: job });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to create job", code: "CREATE_ERROR" });
+    }
+  });
+
+  // PATCH /api/jobs/:id
+  app.patch("/api/jobs/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const job = await storage.getJobById(id);
+      const updates: Parameters<typeof storage.updateJob>[1] = {};
+      const { revenue, laborCost, materialCost, status, notes, scheduledDate, scheduledTime, customerName, customerPhone, address, serviceType } = req.body;
+      if (customerName) updates.customerName = customerName;
+      if (customerPhone !== undefined) updates.customerPhone = customerPhone;
+      if (address) updates.address = address;
+      if (serviceType) updates.serviceType = serviceType;
+      if (scheduledDate) updates.scheduledDate = scheduledDate;
+      if (scheduledTime !== undefined) updates.scheduledTime = scheduledTime;
+      if (status) updates.status = status;
+      if (notes !== undefined) updates.notes = notes;
+      const rev = parseFloat(revenue ?? job?.revenue ?? "0");
+      const labor = parseFloat(laborCost ?? job?.laborCost ?? "0");
+      const mat = parseFloat(materialCost ?? job?.materialCost ?? "0");
+      updates.revenue = rev.toFixed(2);
+      updates.laborCost = labor.toFixed(2);
+      updates.materialCost = mat.toFixed(2);
+      updates.grossProfit = (rev - labor - mat).toFixed(2);
+      const updated = await storage.updateJob(id, updates);
+      res.json({ data: updated });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to update job", code: "UPDATE_ERROR" });
+    }
+  });
+
+  // ── ANALYTICS ─────────────────────────────────────────────────────────────
+
+  // GET /api/analytics/overtime-trends
+  app.get("/api/analytics/overtime-trends", async (req, res) => {
+    try {
+      const weeksNum = req.query.weeks ? parseInt(req.query.weeks as string) : 12;
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - weeksNum * 7);
+      const dateFrom = cutoff.toISOString().split("T")[0];
+
+      type OTRow = { date: string; employee_id: number; emp_name: string; ot_hours: number; hourly_rate: number; ot_rate: number };
+      const rows = storage.sqlite.prepare(`
+        SELECT te.date, te.employee_id,
+          e.first_name || ' ' || e.last_name as emp_name,
+          CAST(te.overtime_hours AS REAL) as ot_hours,
+          CAST(e.hourly_rate AS REAL) as hourly_rate,
+          CAST(e.overtime_rate AS REAL) as ot_rate
+        FROM time_entries te
+        JOIN employees e ON te.employee_id = e.id
+        WHERE te.status = 'approved' AND te.date >= ? AND CAST(te.overtime_hours AS REAL) > 0
+        ORDER BY te.date
+      `).all(dateFrom) as OTRow[];
+
+      function getMonday(d: string) {
+        const dt = new Date(d + "T12:00:00Z");
+        const day = dt.getUTCDay();
+        const diff = day === 0 ? -6 : 1 - day;
+        const mon = new Date(dt);
+        mon.setUTCDate(dt.getUTCDate() + diff);
+        return mon.toISOString().split("T")[0];
+      }
+      function weekLabel(wk: string) {
+        const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+        const s = new Date(wk + "T12:00:00Z");
+        const e = new Date(s);
+        e.setUTCDate(s.getUTCDate() + 6);
+        return `${MONTHS[s.getUTCMonth()]} ${s.getUTCDate()}–${e.getUTCDate()}`;
+      }
+
+      const weekMap = new Map<string, { totalOTHours: number; otCost: number; emps: Map<number, { name: string; hours: number }> }>();
+      for (const row of rows) {
+        const wk = getMonday(row.date);
+        if (!weekMap.has(wk)) weekMap.set(wk, { totalOTHours: 0, otCost: 0, emps: new Map() });
+        const w = weekMap.get(wk)!;
+        w.totalOTHours += row.ot_hours;
+        w.otCost += row.ot_hours * (row.ot_rate > 0 ? row.ot_rate : row.hourly_rate * 1.5);
+        const emp = w.emps.get(row.employee_id) ?? { name: row.emp_name, hours: 0 };
+        emp.hours += row.ot_hours;
+        w.emps.set(row.employee_id, emp);
+      }
+
+      const weeks = [...weekMap.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([wk, d]) => ({
+        weekKey: wk, weekLabel: weekLabel(wk), weekStart: wk,
+        totalOTHours: parseFloat(d.totalOTHours.toFixed(2)),
+        otCost: parseFloat(d.otCost.toFixed(2)),
+        employeesWithOT: d.emps.size,
+        topContributor: [...d.emps.values()].sort((a, b) => b.hours - a.hours)[0]?.name ?? null,
+      }));
+
+      let trend = { direction: "stable" as "up" | "down" | "stable", percentage: "0.0" };
+      if (weeks.length >= 4) {
+        const half = Math.floor(weeks.length / 2);
+        const first = weeks.slice(0, half).reduce((s, w) => s + w.totalOTHours, 0);
+        const last = weeks.slice(-half).reduce((s, w) => s + w.totalOTHours, 0);
+        if (first > 0) {
+          const pct = ((last - first) / first) * 100;
+          trend = { direction: pct > 2 ? "up" : pct < -2 ? "down" : "stable", percentage: Math.abs(pct).toFixed(1) };
+        }
+      }
+
+      res.json({ data: { trend, weeks } });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch OT trends", code: "FETCH_ERROR" });
+    }
+  });
+
+  // GET /api/analytics/labor-costs
+  app.get("/api/analytics/labor-costs", async (req, res) => {
+    try {
+      const { dateFrom, dateTo, groupBy } = req.query;
+      const dFrom = (dateFrom as string) || new Date(Date.now() - 84 * 86400000).toISOString().split("T")[0];
+      const dTo = (dateTo as string) || new Date().toISOString().split("T")[0];
+
+      if (groupBy === "day") {
+        type DayRow = { date: string; regular_cost: number; ot_cost: number };
+        const rows = storage.sqlite.prepare(`
+          SELECT te.date,
+            ROUND(SUM(CAST(te.regular_hours AS REAL) * CAST(e.hourly_rate AS REAL)), 2) as regular_cost,
+            ROUND(SUM(CAST(te.overtime_hours AS REAL) *
+              CASE WHEN CAST(e.overtime_rate AS REAL) > 0 THEN CAST(e.overtime_rate AS REAL)
+                   ELSE CAST(e.hourly_rate AS REAL) * 1.5 END), 2) as ot_cost
+          FROM time_entries te JOIN employees e ON te.employee_id = e.id
+          WHERE te.status = 'approved' AND te.date >= ? AND te.date <= ?
+          GROUP BY te.date ORDER BY te.date
+        `).all(dFrom, dTo) as DayRow[];
+        return res.json({ data: rows.map(r => ({ name: r.date, regularCost: r.regular_cost, otCost: r.ot_cost, totalCost: parseFloat((r.regular_cost + r.ot_cost).toFixed(2)) })) });
+      }
+
+      const gCol = groupBy === "role" ? "e.role" : groupBy === "employee" ? "e.first_name || ' ' || e.last_name" : "COALESCE(e.department, 'Unknown')";
+      type GroupRow = { name: string; regular_cost: number; ot_cost: number };
+      const rows = storage.sqlite.prepare(`
+        SELECT ${gCol} as name,
+          ROUND(SUM(CAST(te.regular_hours AS REAL) * CAST(e.hourly_rate AS REAL)), 2) as regular_cost,
+          ROUND(SUM(CAST(te.overtime_hours AS REAL) *
+            CASE WHEN CAST(e.overtime_rate AS REAL) > 0 THEN CAST(e.overtime_rate AS REAL)
+                 ELSE CAST(e.hourly_rate AS REAL) * 1.5 END), 2) as ot_cost
+        FROM time_entries te JOIN employees e ON te.employee_id = e.id
+        WHERE te.status = 'approved' AND te.date >= ? AND te.date <= ?
+        GROUP BY ${gCol} ORDER BY regular_cost + ot_cost DESC
+      `).all(dFrom, dTo) as GroupRow[];
+
+      res.json({ data: rows.map(r => ({ name: r.name || "Unknown", regularCost: r.regular_cost, otCost: r.ot_cost, totalCost: parseFloat((r.regular_cost + r.ot_cost).toFixed(2)) })) });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch labor costs", code: "FETCH_ERROR" });
+    }
+  });
+
+  // GET /api/analytics/driver-efficiency
+  app.get("/api/analytics/driver-efficiency", async (req, res) => {
+    try {
+      const { dateFrom, dateTo } = req.query;
+      const dFrom = (dateFrom as string) || new Date(Date.now() - 84 * 86400000).toISOString().split("T")[0];
+      const dTo = (dateTo as string) || new Date().toISOString().split("T")[0];
+
+      type DR = { id: number; name: string; total_hours: number; ot_hours: number; days_worked: number; stops_completed: number; total_routes: number; completed_routes: number };
+      const rows = storage.sqlite.prepare(`
+        SELECT e.id, e.first_name || ' ' || e.last_name as name,
+          COALESCE(SUM(CAST(te.total_hours AS REAL)), 0) as total_hours,
+          COALESCE(SUM(CAST(te.overtime_hours AS REAL)), 0) as ot_hours,
+          COUNT(DISTINCT te.date) as days_worked,
+          (SELECT COUNT(*) FROM route_stops rs JOIN routes r ON rs.route_id = r.id
+           WHERE r.assigned_driver_id = e.id AND rs.status = 'completed' AND r.date >= ? AND r.date <= ?) as stops_completed,
+          (SELECT COUNT(*) FROM routes r WHERE r.assigned_driver_id = e.id AND r.date >= ? AND r.date <= ?) as total_routes,
+          (SELECT COUNT(*) FROM routes r WHERE r.assigned_driver_id = e.id AND r.status = 'completed' AND r.date >= ? AND r.date <= ?) as completed_routes
+        FROM employees e
+        LEFT JOIN time_entries te ON te.employee_id = e.id AND te.status = 'approved' AND te.date >= ? AND te.date <= ?
+        WHERE e.role = 'driver' AND e.status = 'active'
+        GROUP BY e.id HAVING total_hours > 0 ORDER BY name
+      `).all(dFrom, dTo, dFrom, dTo, dFrom, dTo, dFrom, dTo) as DR[];
+
+      const totalDays = Math.round((new Date(dTo).getTime() - new Date(dFrom).getTime()) / 86400000) + 1;
+      const businessDays = Math.max(1, Math.round(totalDays * 5 / 7));
+
+      const data = rows.map(r => {
+        const stopsPerHour = r.total_hours > 0 ? r.stops_completed / r.total_hours : 0;
+        const otPct = r.total_hours > 0 ? (r.ot_hours / r.total_hours) * 100 : 0;
+        const rcRate = r.total_routes > 0 ? r.completed_routes / r.total_routes : 1;
+        const avgDailyHrs = r.days_worked > 0 ? r.total_hours / r.days_worked : 0;
+        const speed = Math.min(100, stopsPerHour * 20);
+        const consistency = Math.max(0, 100 - Math.abs(avgDailyHrs - 8) * 10);
+        const attendance = Math.min(100, (r.days_worked / businessDays) * 100);
+        const otDiscipline = Math.max(0, 100 - otPct * 2.5);
+        const completion = rcRate * 100;
+        return {
+          id: r.id, name: r.name,
+          stopsCompleted: r.stops_completed, totalHours: parseFloat(r.total_hours.toFixed(2)),
+          stopsPerHour: parseFloat(stopsPerHour.toFixed(2)), avgDailyHours: parseFloat(avgDailyHrs.toFixed(2)),
+          overtimePercentage: parseFloat(otPct.toFixed(1)), routeCompletionRate: parseFloat(rcRate.toFixed(2)),
+          efficiencyScore: Math.round((speed + consistency + attendance + otDiscipline + completion) / 5),
+          speed: Math.round(speed), consistency: Math.round(consistency),
+          attendance: Math.round(attendance), otDiscipline: Math.round(otDiscipline), completion: Math.round(completion),
+        };
+      });
+
+      res.json({ data });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch driver efficiency", code: "FETCH_ERROR" });
+    }
+  });
+
+  // GET /api/analytics/route-profitability
+  app.get("/api/analytics/route-profitability", async (req, res) => {
+    try {
+      const { dateFrom, dateTo } = req.query;
+      const dFrom = (dateFrom as string) || new Date(Date.now() - 84 * 86400000).toISOString().split("T")[0];
+      const dTo = (dateTo as string) || new Date().toISOString().split("T")[0];
+
+      type RR = { id: number; name: string; estimated_hours: number; total_stops: number; revenue: number; labor_cost: number };
+      const rows = storage.sqlite.prepare(`
+        SELECT r.id, r.name, CAST(r.estimated_hours AS REAL) as estimated_hours, r.total_stops,
+          COALESCE(SUM(CAST(j.revenue AS REAL)), 0) as revenue,
+          COALESCE(SUM(CAST(j.labor_cost AS REAL)), 0) as labor_cost
+        FROM routes r LEFT JOIN jobs j ON j.route_id = r.id
+        WHERE r.date >= ? AND r.date <= ?
+        GROUP BY r.id HAVING revenue > 0
+        ORDER BY revenue DESC LIMIT 15
+      `).all(dFrom, dTo) as RR[];
+
+      const data = rows.map(r => {
+        const margin = r.revenue > 0 ? ((r.revenue - r.labor_cost) / r.revenue * 100) : 0;
+        const label = r.name.length > 22 ? r.name.substring(0, 22) + "…" : r.name;
+        return { id: r.id, name: label, revenue: r.revenue, laborCost: r.labor_cost, margin: parseFloat(margin.toFixed(1)), avgStops: r.total_stops, avgHours: r.estimated_hours };
+      });
+
+      res.json({ data });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch route profitability", code: "FETCH_ERROR" });
+    }
+  });
+
+  // GET /api/analytics/period-comparison
+  app.get("/api/analytics/period-comparison", async (req, res) => {
+    try {
+      const now = new Date();
+      const cTo = (req.query.currentTo as string) || now.toISOString().split("T")[0];
+      const cFrom = (req.query.currentFrom as string) || new Date(now.getTime() - 28 * 86400000).toISOString().split("T")[0];
+      const pTo = (req.query.previousTo as string) || new Date(new Date(cFrom).getTime() - 86400000).toISOString().split("T")[0];
+      const pFrom = (req.query.previousFrom as string) || new Date(new Date(pTo).getTime() - 28 * 86400000).toISOString().split("T")[0];
+
+      type PM = { total_hours: number; ot_hours: number; regular_cost: number; ot_cost: number };
+      const queryPeriod = (from: string, to: string): PM =>
+        storage.sqlite.prepare(`
+          SELECT COALESCE(SUM(CAST(te.total_hours AS REAL)), 0) as total_hours,
+            COALESCE(SUM(CAST(te.overtime_hours AS REAL)), 0) as ot_hours,
+            COALESCE(ROUND(SUM(CAST(te.regular_hours AS REAL) * CAST(e.hourly_rate AS REAL)), 2), 0) as regular_cost,
+            COALESCE(ROUND(SUM(CAST(te.overtime_hours AS REAL) * CASE WHEN CAST(e.overtime_rate AS REAL) > 0 THEN CAST(e.overtime_rate AS REAL) ELSE CAST(e.hourly_rate AS REAL) * 1.5 END), 2), 0) as ot_cost
+          FROM time_entries te JOIN employees e ON te.employee_id = e.id
+          WHERE te.status = 'approved' AND te.date >= ? AND te.date <= ?
+        `).get(from, to) as PM;
+
+      const queryRev = (from: string, to: string): number =>
+        (storage.sqlite.prepare(`SELECT COALESCE(SUM(CAST(revenue AS REAL)), 0) as total FROM jobs WHERE scheduled_date >= ? AND scheduled_date <= ?`).get(from, to) as { total: number }).total;
+
+      const curr = queryPeriod(cFrom, cTo);
+      const prev = queryPeriod(pFrom, pTo);
+
+      res.json({
+        data: [
+          { metric: "Total Hours", current: parseFloat(curr.total_hours.toFixed(2)), previous: parseFloat(prev.total_hours.toFixed(2)) },
+          { metric: "OT Hours", current: parseFloat(curr.ot_hours.toFixed(2)), previous: parseFloat(prev.ot_hours.toFixed(2)) },
+          { metric: "Labor Cost", current: parseFloat((curr.regular_cost + curr.ot_cost).toFixed(2)), previous: parseFloat((prev.regular_cost + prev.ot_cost).toFixed(2)) },
+          { metric: "Revenue", current: parseFloat(queryRev(cFrom, cTo).toFixed(2)), previous: parseFloat(queryRev(pFrom, pTo).toFixed(2)) },
+        ],
+        meta: { currentFrom: cFrom, currentTo: cTo, previousFrom: pFrom, previousTo: pTo },
+      });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch period comparison", code: "FETCH_ERROR" });
+    }
+  });
+
+  // ── DASHBOARD STATS ───────────────────────────────────────────────────────
+  app.get("/api/dashboard/stats", async (_req, res) => {
+    try {
+      const today = new Date().toISOString().split("T")[0];
+
+      // This-week Monday
+      const now = new Date();
+      const dow = now.getUTCDay(); // 0=Sun
+      const diffToMon = dow === 0 ? -6 : 1 - dow;
+      const monday = new Date(now);
+      monday.setUTCDate(now.getUTCDate() + diffToMon);
+      const weekStart = monday.toISOString().split("T")[0];
+      const weekEnd = new Date(monday.getTime() + 6 * 86400000).toISOString().split("T")[0];
+
+      // ── Workforce ─────────────────────────────────────────────────────────
+      const activeDriversRows = storage.sqlite.prepare(`
+        SELECT DISTINCT te.employee_id FROM time_entries te
+        JOIN employees e ON e.id = te.employee_id
+        WHERE te.date = ? AND te.status = 'active'
+      `).all(today) as { employee_id: number }[];
+      const activeDrivers = activeDriversRows.length;
+
+      const onBreakRows = storage.sqlite.prepare(`
+        SELECT COUNT(*) as cnt FROM time_entries te
+        WHERE te.date = ? AND te.status = 'active' AND te.break_start IS NOT NULL AND te.clock_out IS NULL
+      `).get(today) as { cnt: number };
+      const driversOnBreak = Number(onBreakRows?.cnt ?? 0);
+
+      const totalDriversRow = storage.sqlite.prepare(`
+        SELECT COUNT(*) as cnt FROM employees WHERE role = 'driver' AND status = 'active'
+      `).get() as { cnt: number };
+      const totalDrivers = Number(totalDriversRow?.cnt ?? 0);
+
+      // ── Today hours & cost ─────────────────────────────────────────────────
+      interface TERow {
+        total_hours: string; clock_in: string | null; clock_out: string | null;
+        break_minutes: number; status: string; hourly_rate: string; overtime_rate: string;
+      }
+      const todayEntries = storage.sqlite.prepare(`
+        SELECT te.total_hours, te.clock_in, te.clock_out, te.break_minutes, te.status,
+               CAST(e.hourly_rate AS REAL) as hourly_rate, CAST(e.overtime_rate AS REAL) as overtime_rate
+        FROM time_entries te JOIN employees e ON e.id = te.employee_id
+        WHERE te.date = ?
+      `).all(today) as TERow[];
+
+      let todayTotalHours = 0;
+      let todayLaborCost = 0;
+      const nowMs = Date.now();
+      for (const te of todayEntries) {
+        let h = parseFloat(te.total_hours ?? "0");
+        if (te.status === "active" && te.clock_in && !te.clock_out) {
+          const elapsed = (nowMs - new Date(te.clock_in + (te.clock_in.includes("T") ? "" : "T00:00:00Z")).getTime()) / 3600000;
+          const breaks = (te.break_minutes ?? 0) / 60;
+          h = Math.max(0, elapsed - breaks);
+        }
+        todayTotalHours += h;
+        const rate = Number(te.hourly_rate) > 0 ? te.hourly_rate : 0;
+        todayLaborCost += h * Number(rate);
+      }
+
+      // ── Today stops ────────────────────────────────────────────────────────
+      const stopsRow = storage.sqlite.prepare(`
+        SELECT
+          COUNT(*) as total,
+          SUM(CASE WHEN rs.status = 'completed' THEN 1 ELSE 0 END) as completed
+        FROM route_stops rs JOIN routes r ON r.id = rs.route_id WHERE r.date = ?
+      `).get(today) as { total: number; completed: number };
+      const todayTotalStops = Number(stopsRow?.total ?? 0);
+      const todayCompletedStops = Number(stopsRow?.completed ?? 0);
+
+      // ── Weekly hours & OT ──────────────────────────────────────────────────
+      interface WeekRow { employee_id: number; total_hours: string; status: string }
+      const weekEntries = storage.sqlite.prepare(`
+        SELECT employee_id, total_hours, status, clock_in, clock_out, break_minutes
+        FROM time_entries WHERE date >= ? AND date <= ?
+      `).all(weekStart, weekEnd) as (WeekRow & { clock_in: string | null; clock_out: string | null; break_minutes: number })[];
+
+      const weekByEmp = new Map<number, number>();
+      for (const te of weekEntries) {
+        let h = parseFloat(te.total_hours ?? "0");
+        if (te.status === "active" && te.clock_in && !te.clock_out) {
+          const elapsed = (nowMs - new Date(te.clock_in + (te.clock_in.includes("T") ? "" : "T00:00:00Z")).getTime()) / 3600000;
+          h = Math.max(0, elapsed - (te.break_minutes ?? 0) / 60);
+        }
+        weekByEmp.set(te.employee_id, (weekByEmp.get(te.employee_id) ?? 0) + h);
+      }
+      let weeklyTotalHours = 0;
+      let weeklyOvertimeHours = 0;
+      let weeklyLaborCost = 0;
+      for (const [empId, hrs] of weekByEmp) {
+        weeklyTotalHours += hrs;
+        if (hrs > 40) weeklyOvertimeHours += hrs - 40;
+        const emp = storage.sqlite.prepare("SELECT hourly_rate, overtime_rate FROM employees WHERE id = ?").get(empId) as { hourly_rate: string; overtime_rate: string } | undefined;
+        const rate = parseFloat(emp?.hourly_rate ?? "0");
+        const otRate = parseFloat(emp?.overtime_rate ?? "0") || rate * 1.5;
+        const reg = Math.min(hrs, 40);
+        const ot = Math.max(0, hrs - 40);
+        weeklyLaborCost += reg * rate + ot * otRate;
+      }
+
+      // ── Alerts ─────────────────────────────────────────────────────────────
+      const alertCounts = storage.sqlite.prepare(`
+        SELECT
+          COUNT(*) as total,
+          SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END) as critical
+        FROM alerts WHERE resolved = 0
+      `).get() as { total: number; critical: number };
+      const unresolvedAlerts = Number(alertCounts?.total ?? 0);
+      const criticalAlerts = Number(alertCounts?.critical ?? 0);
+
+      // ── Pending approvals ──────────────────────────────────────────────────
+      const pendingRow = storage.sqlite.prepare(
+        "SELECT COUNT(*) as cnt FROM time_entries WHERE status = 'pending'"
+      ).get() as { cnt: number };
+      const pendingApprovals = Number(pendingRow?.cnt ?? 0);
+
+      // ── Recent Activity ────────────────────────────────────────────────────
+      interface TEActivity {
+        id: number; status: string; clock_in: string | null; clock_out: string | null;
+        updated_at: string; created_at: string; total_hours: string;
+        first_name: string; last_name: string;
+      }
+      const recentEntries = storage.sqlite.prepare(`
+        SELECT te.id, te.status, te.clock_in, te.clock_out, te.updated_at, te.created_at, te.total_hours,
+               e.first_name, e.last_name
+        FROM time_entries te JOIN employees e ON e.id = te.employee_id
+        ORDER BY te.updated_at DESC LIMIT 20
+      `).all() as TEActivity[];
+
+      interface AlertActivity { id: number; title: string; message: string; severity: string; created_at: string }
+      const recentAlerts = storage.sqlite.prepare(`
+        SELECT id, title, message, severity, created_at FROM alerts ORDER BY created_at DESC LIMIT 10
+      `).all() as AlertActivity[];
+
+      type ActivityItem = { type: string; description: string; timestamp: string; employeeName?: string };
+      const activityItems: ActivityItem[] = [];
+
+      for (const te of recentEntries) {
+        const name = `${te.first_name} ${te.last_name}`;
+        const ts = te.updated_at || te.created_at;
+        if (te.status === "active" && te.clock_in && !te.clock_out) {
+          const t = new Date(te.clock_in).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+          activityItems.push({ type: "clock_in", description: `${name} clocked in at ${t}`, timestamp: te.clock_in, employeeName: name });
+        } else if (te.clock_out) {
+          activityItems.push({ type: "clock_out", description: `${name} clocked out — ${parseFloat(te.total_hours).toFixed(1)} hours`, timestamp: te.clock_out, employeeName: name });
+        } else if (te.status === "approved") {
+          activityItems.push({ type: "approval", description: `${name}'s timesheet approved`, timestamp: ts, employeeName: name });
+        } else if (te.status === "rejected") {
+          activityItems.push({ type: "rejection", description: `${name}'s time entry rejected`, timestamp: ts, employeeName: name });
+        }
+      }
+      for (const a of recentAlerts) {
+        activityItems.push({ type: "alert", description: a.title, timestamp: a.created_at });
+      }
+      activityItems.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+      const recentActivity = activityItems.slice(0, 10);
+
+      // ── Active routes today ────────────────────────────────────────────────
+      interface RouteRow {
+        id: number; name: string; assigned_driver_id: number | null;
+        first_name: string | null; last_name: string | null;
+        total_stops: number; completed_stops: number;
+      }
+      const routeRows = storage.sqlite.prepare(`
+        SELECT r.id, r.name, r.assigned_driver_id,
+               e.first_name, e.last_name,
+               COUNT(rs.id) as total_stops,
+               SUM(CASE WHEN rs.status = 'completed' THEN 1 ELSE 0 END) as completed_stops
+        FROM routes r
+        LEFT JOIN employees e ON e.id = r.assigned_driver_id
+        LEFT JOIN route_stops rs ON rs.route_id = r.id
+        WHERE r.date = ? AND r.status IN ('active', 'in_progress')
+        GROUP BY r.id
+      `).all(today) as RouteRow[];
+
+      const activeRoutes = await Promise.all(routeRows.map(async r => {
+        const total = Number(r.total_stops ?? 0);
+        const completed = Number(r.completed_stops ?? 0);
+        const progress = total > 0 ? Math.round(completed / total * 100) : 0;
+        const driverName = r.first_name ? `${r.first_name} ${r.last_name}` : "Unassigned";
+
+        let laborCost = 0;
+        if (r.assigned_driver_id) {
+          const { data: tes } = await storage.getTimeEntries({ employeeId: r.assigned_driver_id, dateFrom: today, dateTo: today, limit: 50 });
+          const driver = await storage.getEmployeeById(r.assigned_driver_id);
+          const rate = parseFloat(driver?.hourlyRate ?? "0");
+          for (const te of tes) laborCost += parseFloat(te.totalHours ?? "0") * rate;
+        }
+
+        const { data: jobs } = await storage.getJobs({ routeId: r.id, limit: 200 });
+        const revenue = jobs.reduce((s, j) => s + parseFloat(j.revenue ?? "0"), 0);
+
+        return {
+          id: r.id,
+          name: r.name,
+          driverName,
+          progress,
+          completedStops: completed,
+          totalStops: total,
+          laborCost: laborCost.toFixed(2),
+          revenue: revenue.toFixed(2),
+        };
+      }));
+
+      // ── Overtime exposure ──────────────────────────────────────────────────
+      const activeEmpRows = storage.sqlite.prepare(`
+        SELECT id, first_name, last_name FROM employees WHERE status = 'active'
+      `).all() as { id: number; first_name: string; last_name: string }[];
+
+      const todayDow = new Date(today + "T12:00:00Z").getUTCDay();
+      const workdaysElapsed = todayDow === 0 ? 7 : todayDow === 6 ? 6 : todayDow; // Mon=1..Fri=5, treat as 5 max
+      const workdaysInWeek = 5;
+
+      const overtimeExposure = activeEmpRows
+        .map(e => {
+          const hrs = weekByEmp.get(e.id) ?? 0;
+          const daysWorked = Math.min(workdaysElapsed, workdaysInWeek);
+          const projected = daysWorked > 0 ? (hrs / daysWorked) * workdaysInWeek : hrs;
+          let status: "safe" | "approaching" | "exceeded" = "safe";
+          if (hrs > 40) status = "exceeded";
+          else if (projected >= 38) status = "approaching";
+          return {
+            employeeId: e.id,
+            name: `${e.first_name} ${e.last_name}`,
+            currentWeeklyHours: hrs.toFixed(2),
+            projectedWeeklyHours: projected.toFixed(2),
+            status,
+          };
+        })
+        .filter(e => parseFloat(e.currentWeeklyHours) > 0 || parseFloat(e.projectedWeeklyHours) >= 30);
+
+      overtimeExposure.sort((a, b) => {
+        const order = { exceeded: 0, approaching: 1, safe: 2 };
+        return order[a.status] - order[b.status] || parseFloat(b.currentWeeklyHours) - parseFloat(a.currentWeeklyHours);
+      });
+
+      res.json({
+        data: {
+          activeDrivers,
+          totalDrivers,
+          driversOnBreak,
+          todayTotalHours: todayTotalHours.toFixed(2),
+          todayLaborCost: todayLaborCost.toFixed(2),
+          todayCompletedStops,
+          todayTotalStops,
+          weeklyTotalHours: weeklyTotalHours.toFixed(2),
+          weeklyOvertimeHours: weeklyOvertimeHours.toFixed(2),
+          weeklyLaborCost: weeklyLaborCost.toFixed(2),
+          pendingApprovals,
+          unresolvedAlerts,
+          criticalAlerts,
+          recentActivity,
+          activeRoutes,
+          overtimeExposure,
+        },
+      });
+    } catch (error) {
+      console.error("Dashboard stats error:", error);
+      res.status(500).json({ error: "Failed to fetch dashboard stats", code: "FETCH_ERROR" });
+    }
+  });
+
+  // ── ALERTS ─────────────────────────────────────────────────────────────────
+  app.get("/api/alerts", async (req, res) => {
+    try {
+      const { resolved, severity, limit } = req.query;
+      const data = await storage.getAlerts({
+        resolved: resolved === "false" ? false : resolved === "true" ? true : undefined,
+        severity: severity as string | undefined,
+        limit: limit ? parseInt(limit as string) : 20,
+      });
+      res.json({ data });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch alerts", code: "FETCH_ERROR" });
+    }
+  });
+
+  app.patch("/api/alerts/:id/resolve", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const { userId, notes } = req.body;
+      const data = await storage.resolveAlert(id, userId ?? 1, notes);
+      res.json({ data });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to resolve alert", code: "UPDATE_ERROR" });
+    }
+  });
+
   // ── PAYROLL (legacy) ──────────────────────────────────────────────────────
   app.get("/api/payroll-runs", async (_req, res) => {
     try {
