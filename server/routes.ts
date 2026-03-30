@@ -6,8 +6,16 @@ export function registerRoutes(app: Express) {
   // Employees
   app.get("/api/employees", async (req, res) => {
     try {
-      const data = await storage.getEmployees();
-      res.json({ data });
+      const { status, role, department, search, page, limit } = req.query;
+      const result = await storage.getEmployees({
+        status: status as string | undefined,
+        role: role as string | undefined,
+        department: department as string | undefined,
+        search: search as string | undefined,
+        page: page ? parseInt(page as string) : undefined,
+        limit: limit ? parseInt(limit as string) : undefined,
+      });
+      res.json(result);
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch employees", code: "FETCH_ERROR" });
     }
@@ -16,7 +24,7 @@ export function registerRoutes(app: Express) {
   app.get("/api/employees/:id", async (req, res) => {
     try {
       const id = parseInt(req.params.id);
-      const data = await storage.getEmployee(id);
+      const data = await storage.getEmployeeById(id);
       if (!data) return res.status(404).json({ error: "Employee not found", code: "NOT_FOUND" });
       res.json({ data });
     } catch (error) {
@@ -47,11 +55,30 @@ export function registerRoutes(app: Express) {
     }
   });
 
+  app.delete("/api/employees/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      await storage.deleteEmployee(id);
+      res.json({ data: { success: true } });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to delete employee", code: "DELETE_ERROR" });
+    }
+  });
+
   // Time entries
   app.get("/api/time-entries", async (req, res) => {
     try {
-      const data = await storage.getTimeEntries();
-      res.json({ data });
+      const { employeeId, status, dateFrom, dateTo, routeId, page, limit } = req.query;
+      const result = await storage.getTimeEntries({
+        employeeId: employeeId ? parseInt(employeeId as string) : undefined,
+        status: status as string | undefined,
+        dateFrom: dateFrom as string | undefined,
+        dateTo: dateTo as string | undefined,
+        routeId: routeId ? parseInt(routeId as string) : undefined,
+        page: page ? parseInt(page as string) : undefined,
+        limit: limit ? parseInt(limit as string) : undefined,
+      });
+      res.json(result);
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch time entries", code: "FETCH_ERROR" });
     }
