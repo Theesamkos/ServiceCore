@@ -8,6 +8,8 @@ import EmployeesPage from "@/pages/employees";
 import TimesheetsPage from "@/pages/timesheets";
 import PayrollPage from "@/pages/payroll";
 import RoutesPage from "@/pages/routes";
+import JobCostingPage from "@/pages/job-costing";
+import AnalyticsPage from "@/pages/analytics";
 
 function AppLayout() {
   return (
@@ -20,6 +22,8 @@ function AppLayout() {
           <Route path="/timesheets" component={TimesheetsPage} />
           <Route path="/routes" component={RoutesPage} />
           <Route path="/payroll" component={PayrollPage} />
+          <Route path="/job-costing" component={JobCostingPage} />
+          <Route path="/analytics" component={AnalyticsPage} />
           <Route>
             <div className="p-6">
               <h1 className="text-2xl font-semibold text-gray-900">Page Not Found</h1>

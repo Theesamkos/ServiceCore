@@ -8,6 +8,8 @@ import {
   LogOut,
   Briefcase,
   Map,
+  TrendingUp,
+  BarChart2,
 } from "lucide-react";
 
 const navItems = [
@@ -16,6 +18,8 @@ const navItems = [
   { href: "/timesheets", label: "Timesheets", icon: Clock },
   { href: "/routes", label: "Routes", icon: Map },
   { href: "/payroll", label: "Payroll", icon: DollarSign },
+  { href: "/job-costing", label: "Job Costing", icon: TrendingUp },
+  { href: "/analytics", label: "Analytics", icon: BarChart2 },
 ];
 
 export function Sidebar() {
