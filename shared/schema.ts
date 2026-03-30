@@ -154,6 +154,10 @@ export const timeEntries = sqliteTable("time_entries", {
   approvedBy: integer("approved_by"),
   approvedAt: text("approved_at"),
   rejectedReason: text("rejected_reason"),
+  // Break tracking
+  breakStart: text("break_start"),
+  // Clock-in type
+  clockInType: text("clock_in_type").notNull().default("manual"),
   notes: text("notes"),
   createdAt: text("created_at").notNull().default(""),
   updatedAt: text("updated_at").notNull().default(""),

@@ -149,6 +149,8 @@ sqlite.exec(`
     approved_by INTEGER,
     approved_at TEXT,
     rejected_reason TEXT,
+    break_start TEXT,
+    clock_in_type TEXT NOT NULL DEFAULT 'manual',
     notes TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -245,6 +247,14 @@ sqlite.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
+
+// Migrations for existing DBs (add new columns gracefully)
+for (const stmt of [
+  "ALTER TABLE time_entries ADD COLUMN break_start TEXT",
+  "ALTER TABLE time_entries ADD COLUMN clock_in_type TEXT NOT NULL DEFAULT 'manual'",
+]) {
+  try { sqlite.exec(stmt); } catch { /* column already exists */ }
+}
 
 // Seed is handled by server/seed.ts on first run
 
@@ -754,4 +764,8 @@ export const storage = {
     }).returning();
     return result[0];
   },
+
+  // Expose raw sqlite for complex queries in route handlers
+  get db() { return db; },
+  get sqlite() { return sqlite; },
 };
