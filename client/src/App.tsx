@@ -1,6 +1,7 @@
 import { Switch, Route } from "wouter";
 import { AuthProvider, useAuth } from "@/contexts/auth-context";
 import { Sidebar } from "@/components/layout/sidebar";
+import { Toaster } from "@/components/ui/toaster";
 import LoginPage from "@/pages/login";
 import DashboardPage from "@/pages/dashboard";
 import EmployeesPage from "@/pages/employees";
@@ -38,6 +39,7 @@ export default function App() {
   return (
     <AuthProvider>
       <AuthGate />
+      <Toaster />
     </AuthProvider>
   );
 }

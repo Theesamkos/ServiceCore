@@ -7,15 +7,25 @@ export function registerRoutes(app: Express) {
   app.get("/api/employees", async (req, res) => {
     try {
       const { status, role, department, search, page, limit } = req.query;
+      const pageNum = page ? parseInt(page as string) : 1;
+      const limitNum = limit ? parseInt(limit as string) : 50;
       const result = await storage.getEmployees({
         status: status as string | undefined,
         role: role as string | undefined,
         department: department as string | undefined,
         search: search as string | undefined,
-        page: page ? parseInt(page as string) : undefined,
-        limit: limit ? parseInt(limit as string) : undefined,
+        page: pageNum,
+        limit: limitNum,
       });
-      res.json(result);
+      res.json({
+        data: result.data,
+        pagination: {
+          page: pageNum,
+          limit: limitNum,
+          total: result.total,
+          totalPages: Math.ceil(result.total / limitNum),
+        },
+      });
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch employees", code: "FETCH_ERROR" });
     }
