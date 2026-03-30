@@ -10,6 +10,7 @@ import {
   Map,
   TrendingUp,
   BarChart2,
+  Settings,
 } from "lucide-react";
 
 const navItems = [
@@ -20,6 +21,7 @@ const navItems = [
   { href: "/payroll", label: "Payroll", icon: DollarSign },
   { href: "/job-costing", label: "Job Costing", icon: TrendingUp },
   { href: "/analytics", label: "Analytics", icon: BarChart2 },
+  { href: "/settings", label: "Settings", icon: Settings },
 ];
 
 export function Sidebar() {

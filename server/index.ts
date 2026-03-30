@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from "express";
 import { registerRoutes } from "./routes";
 import { setupVite } from "./vite";
@@ -27,6 +28,6 @@ if (process.env.NODE_ENV === "production") {
   await setupVite(app);
 }
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`ServiceCore server running on port ${PORT}`);
 });

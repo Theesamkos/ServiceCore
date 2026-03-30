@@ -1,9 +1,13 @@
 import type { Express } from "express";
+import Anthropic from "@anthropic-ai/sdk";
 import { storage } from "./storage";
-import { insertEmployeeSchema, insertPayrollRunSchema } from "@shared/schema";
+import { insertEmployeeSchema, insertPayrollRunSchema, insertOvertimeRuleSchema, insertGeofenceSchema } from "@shared/schema";
 import { isWithinGeofence, haversineDistance } from "./utils";
 import { calculatePayrollForPeriod } from "./payroll-calculator";
 import { generatePayrollCSV, generatePayrollIIF } from "./export-utils";
+
+// Only initialize Anthropic if API key is available (chat will gracefully degrade without it)
+const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
 
 export function registerRoutes(app: Express) {
 
@@ -1550,6 +1554,254 @@ export function registerRoutes(app: Express) {
       res.json({ data });
     } catch (error) {
       res.status(500).json({ error: "Failed to resolve alert", code: "UPDATE_ERROR" });
+    }
+  });
+
+  // ── AI CHAT ────────────────────────────────────────────────────────────────
+  app.post("/api/chat", async (req, res) => {
+    try {
+      if (!anthropic) {
+        return res.status(503).json({ error: "AI chat not configured. Set ANTHROPIC_API_KEY environment variable." });
+      }
+      const { message, history = [] } = req.body as {
+        message: string;
+        history?: { role: "user" | "assistant"; content: string }[];
+      };
+      if (!message) return res.status(400).json({ error: "Message required" });
+
+      // Build real-time context block
+      const today = new Date().toISOString().split("T")[0];
+      const nowMs = Date.now();
+
+      // Active drivers today
+      const activeDriversRows = storage.sqlite.prepare(
+        `SELECT COUNT(DISTINCT te.employee_id) as cnt FROM time_entries te WHERE te.date = ? AND te.status = 'active'`
+      ).get(today) as { cnt: number };
+      const totalDriversRow = storage.sqlite.prepare(
+        `SELECT COUNT(*) as cnt FROM employees WHERE role = 'driver' AND status = 'active'`
+      ).get() as { cnt: number };
+
+      // Today's hours & cost
+      interface TodayTE { total_hours: string; clock_in: string | null; status: string; break_minutes: number; hourly_rate: string }
+      const todayEntries = storage.sqlite.prepare(
+        `SELECT te.total_hours, te.clock_in, te.status, te.break_minutes, e.hourly_rate
+         FROM time_entries te JOIN employees e ON e.id = te.employee_id WHERE te.date = ?`
+      ).all(today) as TodayTE[];
+      let todayHours = 0, todayLabor = 0;
+      for (const te of todayEntries) {
+        let h = parseFloat(te.total_hours ?? "0");
+        if (te.status === "active" && te.clock_in) {
+          const elapsed = (nowMs - new Date(te.clock_in + (te.clock_in.includes("T") ? "" : "T00:00:00Z")).getTime()) / 3600000;
+          h = Math.max(0, elapsed - (te.break_minutes ?? 0) / 60);
+        }
+        todayHours += h;
+        todayLabor += h * parseFloat(te.hourly_rate ?? "0");
+      }
+
+      // Weekly OT
+      const d = new Date(); const dow = d.getUTCDay();
+      const mon = new Date(d); mon.setUTCDate(d.getUTCDate() + (dow === 0 ? -6 : 1 - dow));
+      const weekStart = mon.toISOString().split("T")[0];
+      const weekEnd = new Date(mon.getTime() + 6 * 86400000).toISOString().split("T")[0];
+      interface WeekTE { employee_id: number; total_hours: string; status: string; clock_in: string | null; break_minutes: number }
+      const weekEntries = storage.sqlite.prepare(
+        `SELECT employee_id, total_hours, status, clock_in, break_minutes FROM time_entries WHERE date >= ? AND date <= ?`
+      ).all(weekStart, weekEnd) as WeekTE[];
+      const weekByEmp = new Map<number, number>();
+      for (const te of weekEntries) {
+        let h = parseFloat(te.total_hours ?? "0");
+        if (te.status === "active" && te.clock_in) {
+          h = Math.max(0, (nowMs - new Date(te.clock_in + (te.clock_in.includes("T") ? "" : "T00:00:00Z")).getTime()) / 3600000 - (te.break_minutes ?? 0) / 60);
+        }
+        weekByEmp.set(te.employee_id, (weekByEmp.get(te.employee_id) ?? 0) + h);
+      }
+      let weeklyOT = 0;
+      for (const hrs of weekByEmp.values()) { if (hrs > 40) weeklyOT += hrs - 40; }
+
+      // Pending approvals
+      const pendingRow = storage.sqlite.prepare(`SELECT COUNT(*) as cnt FROM time_entries WHERE status = 'pending'`).get() as { cnt: number };
+
+      // OT exposure
+      interface EmpOT { id: number; first_name: string; last_name: string }
+      const empRows = storage.sqlite.prepare(`SELECT id, first_name, last_name FROM employees WHERE status = 'active'`).all() as EmpOT[];
+      const todayDow = new Date(today + "T12:00:00Z").getUTCDay();
+      const daysElapsed = Math.min(todayDow === 0 ? 7 : todayDow === 6 ? 6 : todayDow, 5);
+      const exposureLines = empRows
+        .map(e => {
+          const hrs = weekByEmp.get(e.id) ?? 0;
+          if (hrs === 0) return null;
+          const proj = daysElapsed > 0 ? (hrs / daysElapsed) * 5 : hrs;
+          const status = hrs > 40 ? "exceeded" : proj >= 38 ? "approaching" : "safe";
+          return `- ${e.first_name} ${e.last_name}: ${hrs.toFixed(1)}h this week (${status})`;
+        })
+        .filter(Boolean);
+
+      // Active routes
+      const activeRoutesRows = storage.sqlite.prepare(
+        `SELECT r.name, e.first_name, e.last_name, COUNT(rs.id) as total, SUM(CASE WHEN rs.status='completed' THEN 1 ELSE 0 END) as done
+         FROM routes r LEFT JOIN employees e ON e.id = r.assigned_driver_id LEFT JOIN route_stops rs ON rs.route_id = r.id
+         WHERE r.date = ? AND r.status IN ('active','in_progress') GROUP BY r.id`
+      ).all(today) as { name: string; first_name: string | null; last_name: string | null; total: number; done: number }[];
+
+      // Recent alerts
+      const recentAlerts = await storage.getAlerts({ resolved: false, limit: 5 });
+
+      const contextBlock = `
+## CURRENT REAL-TIME DATA (as of ${new Date().toISOString()}):
+
+### Workforce Status:
+- Active Drivers: ${Number(activeDriversRows?.cnt ?? 0)} of ${Number(totalDriversRow?.cnt ?? 0)}
+- Today's Total Hours: ${todayHours.toFixed(2)}h
+- Today's Labor Cost: $${todayLabor.toFixed(2)}
+- Weekly Overtime Hours: ${weeklyOT.toFixed(2)}h
+- Pending Timesheet Approvals: ${Number(pendingRow?.cnt ?? 0)}
+- Active Routes Today: ${activeRoutesRows.length}${activeRoutesRows.length > 0 ? "\n" + activeRoutesRows.map(r => `  • ${r.name} — ${r.first_name ? r.first_name + " " + r.last_name : "Unassigned"} (${r.done}/${r.total} stops)`).join("\n") : ""}
+
+### Overtime Exposure This Week:
+${exposureLines.length > 0 ? exposureLines.join("\n") : "No employees with hours this week"}
+
+### Unresolved Alerts:
+${recentAlerts.length > 0 ? recentAlerts.map(a => `- [${a.severity}] ${a.title}: ${a.message}`).join("\n") : "No unresolved alerts"}
+`;
+
+      const systemPrompt = `You are an AI assistant for ServiceCore, a field service workforce management platform used by portable sanitation, septic, and roll-off companies. You help managers and dispatchers make decisions about their workforce, routes, and payroll.
+
+You have access to real-time data from the ServiceCore database. Use this data to answer questions accurately and specifically.
+
+${contextBlock}
+
+Answer questions concisely and professionally. When referencing numbers, use the real data above. If asked about historical data or specific records you don't have in context, acknowledge that and suggest where to find it in the app.`;
+
+      // Stream the response
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+
+      const messages: Anthropic.MessageParam[] = [
+        ...history.map(h => ({ role: h.role, content: h.content })),
+        { role: "user", content: message },
+      ];
+
+      const stream = anthropic.messages.stream({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 1024,
+        system: systemPrompt,
+        messages,
+      });
+
+      stream.on("text", (text) => {
+        res.write(`data: ${JSON.stringify({ text })}\n\n`);
+      });
+
+      stream.on("finalMessage", () => {
+        res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+        res.end();
+      });
+
+      stream.on("error", (err) => {
+        res.write(`data: ${JSON.stringify({ error: String(err) })}\n\n`);
+        res.end();
+      });
+    } catch (error) {
+      console.error("Chat error:", error);
+      res.status(500).json({ error: "Chat failed", code: "CHAT_ERROR" });
+    }
+  });
+
+  // ── OVERTIME RULES ─────────────────────────────────────────────────────────
+  app.get("/api/overtime-rules", async (req, res) => {
+    try {
+      const { status } = req.query;
+      const data = await storage.getOvertimeRules({ status: status as string | undefined });
+      res.json({ data });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch overtime rules", code: "FETCH_ERROR" });
+    }
+  });
+
+  app.post("/api/overtime-rules", async (req, res) => {
+    try {
+      const parsed = insertOvertimeRuleSchema.safeParse(req.body);
+      if (!parsed.success) return res.status(400).json({ error: "Invalid data", code: "VALIDATION_ERROR", details: parsed.error.issues });
+      const data = await storage.createOvertimeRule(parsed.data);
+      res.status(201).json({ data });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to create overtime rule", code: "CREATE_ERROR" });
+    }
+  });
+
+  app.patch("/api/overtime-rules/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const data = await storage.updateOvertimeRule(id, req.body);
+      res.json({ data });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to update overtime rule", code: "UPDATE_ERROR" });
+    }
+  });
+
+  // ── GEOFENCES ──────────────────────────────────────────────────────────────
+  app.get("/api/geofences", async (req, res) => {
+    try {
+      const { status } = req.query;
+      const data = await storage.getGeofences({ status: status as string | undefined });
+      res.json({ data });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch geofences", code: "FETCH_ERROR" });
+    }
+  });
+
+  app.post("/api/geofences", async (req, res) => {
+    try {
+      const parsed = insertGeofenceSchema.safeParse(req.body);
+      if (!parsed.success) return res.status(400).json({ error: "Invalid data", code: "VALIDATION_ERROR", details: parsed.error.issues });
+      const data = await storage.createGeofence(parsed.data);
+      res.status(201).json({ data });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to create geofence", code: "CREATE_ERROR" });
+    }
+  });
+
+  app.patch("/api/geofences/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const data = await storage.updateGeofence(id, req.body);
+      res.json({ data });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to update geofence", code: "UPDATE_ERROR" });
+    }
+  });
+
+  app.delete("/api/geofences/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      await storage.updateGeofence(id, { status: "inactive" });
+      res.json({ data: { id, status: "inactive" } });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to delete geofence", code: "DELETE_ERROR" });
+    }
+  });
+
+  // ── AUDIT LOG ──────────────────────────────────────────────────────────────
+  app.get("/api/audit-log", async (req, res) => {
+    try {
+      const { tableName, action, dateFrom, dateTo, page, limit } = req.query;
+      const result = await storage.getAuditLog({
+        tableName: tableName as string | undefined,
+        action: action as string | undefined,
+        dateFrom: dateFrom as string | undefined,
+        dateTo: dateTo as string | undefined,
+        page: page ? parseInt(page as string) : 1,
+        limit: limit ? parseInt(limit as string) : 50,
+      });
+      const pageNum = page ? parseInt(page as string) : 1;
+      const limitNum = limit ? parseInt(limit as string) : 50;
+      res.json({
+        data: result.data,
+        pagination: { page: pageNum, limit: limitNum, total: result.total, totalPages: Math.ceil(result.total / limitNum) },
+      });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch audit log", code: "FETCH_ERROR" });
     }
   });
 

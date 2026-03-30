@@ -10,6 +10,8 @@ import PayrollPage from "@/pages/payroll";
 import RoutesPage from "@/pages/routes";
 import JobCostingPage from "@/pages/job-costing";
 import AnalyticsPage from "@/pages/analytics";
+import SettingsPage from "@/pages/settings";
+import { ChatWidget } from "@/components/chat-widget";
 
 function AppLayout() {
   return (
@@ -24,6 +26,7 @@ function AppLayout() {
           <Route path="/payroll" component={PayrollPage} />
           <Route path="/job-costing" component={JobCostingPage} />
           <Route path="/analytics" component={AnalyticsPage} />
+          <Route path="/settings" component={SettingsPage} />
           <Route>
             <div className="p-6">
               <h1 className="text-2xl font-semibold text-gray-900">Page Not Found</h1>
@@ -31,6 +34,7 @@ function AppLayout() {
           </Route>
         </Switch>
       </main>
+      <ChatWidget />
     </div>
   );
 }
