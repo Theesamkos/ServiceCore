@@ -882,10 +882,13 @@ export function registerRoutes(app: Express) {
 
       const totalRevenue = jobs.reduce((s, j) => s + parseFloat(j.revenue ?? "0"), 0);
       const totalLaborCost = jobs.reduce((s, j) => s + parseFloat(j.laborCost ?? "0"), 0);
-      const overallMargin = totalRevenue > 0 ? (totalRevenue - totalLaborCost) / totalRevenue * 100 : 0;
-      const unprofitableJobs = jobs.filter(j => parseFloat(j.laborCost ?? "0") > parseFloat(j.revenue ?? "0")).length;
+      const totalMaterialCost = jobs.reduce((s, j) => s + parseFloat(j.materialCost ?? "0"), 0);
+      const totalTrueCost = totalLaborCost + totalMaterialCost;
+      const totalGrossProfit = totalRevenue - totalTrueCost;
+      const overallMargin = totalRevenue > 0 ? (totalGrossProfit / totalRevenue) * 100 : 0;
+      const unprofitableJobs = jobs.filter(j => (parseFloat(j.laborCost ?? "0") + parseFloat(j.materialCost ?? "0")) > parseFloat(j.revenue ?? "0")).length;
 
-      type BI = { name: string; revenue: string; laborCost: string; grossProfit: string; margin: string; jobCount: number };
+      type BI = { name: string; revenue: string; laborCost: string; materialCost: string; grossProfit: string; margin: string; jobCount: number };
       const breakdown: BI[] = [];
 
       if (groupBy === "serviceType" || groupBy === "customer") {
@@ -898,9 +901,11 @@ export function registerRoutes(app: Express) {
         }
         for (const [name, grp] of gmap) {
           const rev = grp.reduce((s, j) => s + parseFloat(j.revenue ?? "0"), 0);
-          const cost = grp.reduce((s, j) => s + parseFloat(j.laborCost ?? "0"), 0);
+          const labor = grp.reduce((s, j) => s + parseFloat(j.laborCost ?? "0"), 0);
+          const mat = grp.reduce((s, j) => s + parseFloat(j.materialCost ?? "0"), 0);
+          const cost = labor + mat;
           const profit = rev - cost;
-          breakdown.push({ name, revenue: rev.toFixed(2), laborCost: cost.toFixed(2), grossProfit: profit.toFixed(2), margin: rev > 0 ? ((profit / rev) * 100).toFixed(1) : "0.0", jobCount: grp.length });
+          breakdown.push({ name, revenue: rev.toFixed(2), laborCost: labor.toFixed(2), materialCost: mat.toFixed(2), grossProfit: profit.toFixed(2), margin: rev > 0 ? ((profit / rev) * 100).toFixed(1) : "0.0", jobCount: grp.length });
         }
         breakdown.sort((a, b) => parseFloat(b.revenue) - parseFloat(a.revenue));
       } else if (groupBy === "route") {
@@ -918,14 +923,16 @@ export function registerRoutes(app: Express) {
         for (const [routeId, grp] of gmap) {
           const name = routeId ? routeNames.get(routeId) ?? `Route ${routeId}` : "No Route";
           const rev = grp.reduce((s, j) => s + parseFloat(j.revenue ?? "0"), 0);
-          const cost = grp.reduce((s, j) => s + parseFloat(j.laborCost ?? "0"), 0);
+          const labor = grp.reduce((s, j) => s + parseFloat(j.laborCost ?? "0"), 0);
+          const mat = grp.reduce((s, j) => s + parseFloat(j.materialCost ?? "0"), 0);
+          const cost = labor + mat;
           const profit = rev - cost;
-          breakdown.push({ name, revenue: rev.toFixed(2), laborCost: cost.toFixed(2), grossProfit: profit.toFixed(2), margin: rev > 0 ? ((profit / rev) * 100).toFixed(1) : "0.0", jobCount: grp.length });
+          breakdown.push({ name, revenue: rev.toFixed(2), laborCost: labor.toFixed(2), materialCost: mat.toFixed(2), grossProfit: profit.toFixed(2), margin: rev > 0 ? ((profit / rev) * 100).toFixed(1) : "0.0", jobCount: grp.length });
         }
         breakdown.sort((a, b) => parseFloat(b.revenue) - parseFloat(a.revenue));
       }
 
-      res.json({ data: { totalRevenue: totalRevenue.toFixed(2), totalLaborCost: totalLaborCost.toFixed(2), overallMargin: overallMargin.toFixed(1), totalJobs: jobs.length, unprofitableJobs, breakdown } });
+      res.json({ data: { totalRevenue: totalRevenue.toFixed(2), totalLaborCost: totalLaborCost.toFixed(2), totalMaterialCost: totalMaterialCost.toFixed(2), totalTrueCost: totalTrueCost.toFixed(2), totalGrossProfit: totalGrossProfit.toFixed(2), avgMargin: overallMargin.toFixed(1), overallMargin: overallMargin.toFixed(1), totalJobs: jobs.length, unprofitableJobs, breakdown } });
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch costing summary", code: "FETCH_ERROR" });
     }
@@ -964,8 +971,11 @@ export function registerRoutes(app: Express) {
         const route = job.routeId ? routeMap.get(job.routeId) : null;
         const rev = parseFloat(job.revenue ?? "0");
         const labor = parseFloat(job.laborCost ?? "0");
-        const margin = rev > 0 ? ((rev - labor) / rev * 100).toFixed(1) : null;
-        return { ...job, routeName: route?.name ?? null, driverName: route?.assignedDriverId ? driverMap.get(route.assignedDriverId) ?? null : null, margin };
+        const mat = parseFloat(job.materialCost ?? "0");
+        const trueCost = labor + mat;
+        const grossProfit = (rev - trueCost).toFixed(2);
+        const margin = rev > 0 ? ((rev - trueCost) / rev * 100).toFixed(1) : null;
+        return { ...job, grossProfit, routeName: route?.name ?? null, driverName: route?.assignedDriverId ? driverMap.get(route.assignedDriverId) ?? null : null, margin };
       });
 
       if (profitability === "profitable") data = data.filter(j => j.margin !== null && parseFloat(j.margin) > 0);
@@ -1505,6 +1515,22 @@ export function registerRoutes(app: Express) {
         return order[a.status] - order[b.status] || parseFloat(b.currentWeeklyHours) - parseFloat(a.currentWeeklyHours);
       });
 
+      // ── Today & weekly revenue/profit ──────────────────────────────────────
+      const todayRevenueRow = storage.sqlite.prepare(`
+        SELECT COALESCE(SUM(CAST(revenue AS REAL)), 0) as rev,
+               COALESCE(SUM(CAST(gross_profit AS REAL)), 0) as profit
+        FROM jobs WHERE scheduled_date = ?
+      `).get(today) as { rev: number; profit: number };
+      const weekRevenueRow = storage.sqlite.prepare(`
+        SELECT COALESCE(SUM(CAST(revenue AS REAL)), 0) as rev,
+               COALESCE(SUM(CAST(gross_profit AS REAL)), 0) as profit
+        FROM jobs WHERE scheduled_date >= ? AND scheduled_date <= ?
+      `).get(weekStart, weekEnd) as { rev: number; profit: number };
+      const todayRevenue = Number(todayRevenueRow?.rev ?? 0);
+      const todayGrossProfit = Number(todayRevenueRow?.profit ?? 0);
+      const weeklyRevenue = Number(weekRevenueRow?.rev ?? 0);
+      const weeklyGrossProfit = Number(weekRevenueRow?.profit ?? 0);
+
       res.json({
         data: {
           activeDrivers,
@@ -1517,6 +1543,10 @@ export function registerRoutes(app: Express) {
           weeklyTotalHours: weeklyTotalHours.toFixed(2),
           weeklyOvertimeHours: weeklyOvertimeHours.toFixed(2),
           weeklyLaborCost: weeklyLaborCost.toFixed(2),
+          todayRevenue: todayRevenue.toFixed(2),
+          todayGrossProfit: todayGrossProfit.toFixed(2),
+          weeklyRevenue: weeklyRevenue.toFixed(2),
+          weeklyGrossProfit: weeklyGrossProfit.toFixed(2),
           pendingApprovals,
           unresolvedAlerts,
           criticalAlerts,

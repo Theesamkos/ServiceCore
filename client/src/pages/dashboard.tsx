@@ -19,6 +19,10 @@ interface DashboardStats {
   weeklyTotalHours: string;
   weeklyOvertimeHours: string;
   weeklyLaborCost: string;
+  todayRevenue: string;
+  todayGrossProfit: string;
+  weeklyRevenue: string;
+  weeklyGrossProfit: string;
   pendingApprovals: number;
   unresolvedAlerts: number;
   criticalAlerts: number;
@@ -132,12 +136,12 @@ export default function DashboardPage() {
       </div>
 
       {/* Row 1: Stat cards */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3">
         {isLoading ? (
-          Array.from({ length: 6 }).map((_, i) => (
-            <div key={i} className="bg-white rounded-lg border border-gray-200 p-5 space-y-3">
-              <Skeleton className="h-3 w-24" />
-              <Skeleton className="h-7 w-16" />
+          Array.from({ length: 8 }).map((_, i) => (
+            <div key={i} className="bg-white rounded-lg border border-gray-200 p-4 space-y-3">
+              <Skeleton className="h-3 w-20" />
+              <Skeleton className="h-6 w-14" />
             </div>
           ))
         ) : (
@@ -160,6 +164,20 @@ export default function DashboardPage() {
               icon={<DollarSign className="w-4 h-4" />}
             />
             <StatCard
+              title="Today's Revenue"
+              value={parseFloat(stats?.todayRevenue ?? "0")}
+              format="currency"
+              icon={<TrendingUp className="w-4 h-4 text-green-500" />}
+              className="border-green-100"
+            />
+            <StatCard
+              title="Today's Profit"
+              value={parseFloat(stats?.todayGrossProfit ?? "0")}
+              format="currency"
+              icon={<Briefcase className={`w-4 h-4 ${parseFloat(stats?.todayGrossProfit ?? "0") >= 0 ? "text-green-500" : "text-red-500"}`} />}
+              className={parseFloat(stats?.todayGrossProfit ?? "0") < 0 ? "border-red-200 bg-red-50" : "border-green-100"}
+            />
+            <StatCard
               title="Weekly OT Hours"
               value={parseFloat(stats?.weeklyOvertimeHours ?? "0")}
               format="hours"
@@ -174,8 +192,8 @@ export default function DashboardPage() {
               className={(stats?.pendingApprovals ?? 0) > 0 ? "border-amber-200 bg-amber-50" : ""}
             />
             <StatCard
-              title="Active Routes"
-              value={`${stats?.todayCompletedStops ?? 0}/${stats?.todayTotalStops ?? 0} stops`}
+              title="Route Stops"
+              value={`${stats?.todayCompletedStops ?? 0}/${stats?.todayTotalStops ?? 0}`}
               icon={<MapPin className="w-4 h-4" />}
             />
           </>

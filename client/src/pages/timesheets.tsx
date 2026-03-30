@@ -12,7 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
-import { Check, X, Plus, ChevronLeft, ChevronRight, Loader2 } from "lucide-react";
+import { Check, X, Plus, ChevronLeft, ChevronRight, Loader2, CheckCircle } from "lucide-react";
 import { format } from "date-fns";
 import type { TimeEntry } from "@shared/schema";
 
@@ -145,10 +145,26 @@ export default function TimesheetsPage() {
           <h1 className="text-2xl font-semibold text-gray-900">Timesheets</h1>
           <p className="text-sm text-gray-500 mt-0.5">Track and approve employee hours</p>
         </div>
-        <Button onClick={() => setFormOpen(true)} className="gap-2">
-          <Plus className="w-4 h-4" />
-          Manual Entry
-        </Button>
+        <div className="flex items-center gap-2">
+          {pendingCount > 0 && (
+            <Button
+              variant="outline"
+              className="gap-2 border-green-300 text-green-700 hover:bg-green-50"
+              onClick={() => {
+                const pendingIds = entries.filter(e => e.status === "pending").map(e => e.id);
+                if (pendingIds.length > 0) bulkApproveMutation.mutate(pendingIds);
+              }}
+              disabled={bulkApproveMutation.isPending}
+            >
+              {bulkApproveMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
+              Approve All ({pendingCount})
+            </Button>
+          )}
+          <Button onClick={() => setFormOpen(true)} className="gap-2">
+            <Plus className="w-4 h-4" />
+            Manual Entry
+          </Button>
+        </div>
       </div>
 
       {/* Clock widget */}
