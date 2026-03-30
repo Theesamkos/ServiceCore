@@ -7,12 +7,14 @@ import {
   DollarSign,
   LogOut,
   Briefcase,
+  Map,
 } from "lucide-react";
 
 const navItems = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/employees", label: "Employees", icon: Users },
   { href: "/timesheets", label: "Timesheets", icon: Clock },
+  { href: "/routes", label: "Routes", icon: Map },
   { href: "/payroll", label: "Payroll", icon: DollarSign },
 ];
 

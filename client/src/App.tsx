@@ -7,6 +7,7 @@ import DashboardPage from "@/pages/dashboard";
 import EmployeesPage from "@/pages/employees";
 import TimesheetsPage from "@/pages/timesheets";
 import PayrollPage from "@/pages/payroll";
+import RoutesPage from "@/pages/routes";
 
 function AppLayout() {
   return (
@@ -17,6 +18,7 @@ function AppLayout() {
           <Route path="/" component={DashboardPage} />
           <Route path="/employees" component={EmployeesPage} />
           <Route path="/timesheets" component={TimesheetsPage} />
+          <Route path="/routes" component={RoutesPage} />
           <Route path="/payroll" component={PayrollPage} />
           <Route>
             <div className="p-6">

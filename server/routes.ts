@@ -380,19 +380,222 @@ export function registerRoutes(app: Express) {
     }
   });
 
-  // ── ROUTES listing (for dropdowns) ────────────────────────────────────────
+  // ── ROUTES ────────────────────────────────────────────────────────────────
+
+  // Helper: compute derived fields (driverName, laborCost, revenue, margin) for a route
+  async function enrichRoute(route: Awaited<ReturnType<typeof storage.getRouteById>>) {
+    if (!route) return null;
+    let driverName: string | null = null;
+    let laborCost = 0;
+
+    if (route.assignedDriverId) {
+      const driver = await storage.getEmployeeById(route.assignedDriverId);
+      if (driver) {
+        driverName = `${driver.firstName} ${driver.lastName}`;
+        const { data: tes } = await storage.getTimeEntries({
+          employeeId: driver.id,
+          dateFrom: route.date,
+          dateTo: route.date,
+          limit: 50,
+        });
+        for (const te of tes) {
+          laborCost += parseFloat(te.totalHours ?? "0") * parseFloat(driver.hourlyRate ?? "0");
+        }
+      }
+    }
+
+    const { data: jobs } = await storage.getJobs({ routeId: route.id, limit: 500 });
+    const revenue = jobs.reduce((s, j) => s + parseFloat(j.revenue ?? "0"), 0);
+    const margin = revenue > 0
+      ? ((revenue - laborCost) / revenue * 100).toFixed(1)
+      : null;
+
+    return { ...route, driverName, laborCost: laborCost.toFixed(2), revenue: revenue.toFixed(2), margin };
+  }
+
+  // GET /api/routes — list with computed fields
   app.get("/api/routes", async (req, res) => {
     try {
-      const { dateFrom, dateTo, status, limit } = req.query;
+      const { date, dateFrom, dateTo, assignedDriverId, status, zone, page, limit } = req.query;
+      const pageNum = page ? parseInt(page as string) : 1;
+      const limitNum = limit ? parseInt(limit as string) : 25;
       const result = await storage.getRoutes({
+        date: date as string | undefined,
         dateFrom: dateFrom as string | undefined,
         dateTo: dateTo as string | undefined,
+        assignedDriverId: assignedDriverId ? parseInt(assignedDriverId as string) : undefined,
         status: status as string | undefined,
-        limit: limit ? parseInt(limit as string) : 100,
+        zone: zone as string | undefined,
+        page: pageNum,
+        limit: limitNum,
       });
-      res.json({ data: result.data, pagination: { total: result.total } });
+      const enriched = await Promise.all(result.data.map(r => enrichRoute(r)));
+      res.json({
+        data: enriched.filter(Boolean),
+        pagination: { page: pageNum, limit: limitNum, total: result.total, totalPages: Math.ceil(result.total / limitNum) },
+      });
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch routes", code: "FETCH_ERROR" });
+    }
+  });
+
+  // POST /api/routes — create route
+  app.post("/api/routes", async (req, res) => {
+    try {
+      const { name, zone, assignedDriverId, date, estimatedHours, notes } = req.body;
+      if (!name || !date || !estimatedHours) {
+        return res.status(400).json({ error: "name, date, and estimatedHours are required", code: "VALIDATION_ERROR" });
+      }
+      const route = await storage.createRoute({
+        name,
+        zone: zone ?? null,
+        assignedDriverId: assignedDriverId ? parseInt(assignedDriverId) : null,
+        date,
+        estimatedHours: parseFloat(estimatedHours).toFixed(2),
+        actualHours: "0.00",
+        totalStops: 0,
+        completedStops: 0,
+        status: "scheduled",
+        notes: notes ?? null,
+      });
+      res.status(201).json({ data: route });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to create route", code: "CREATE_ERROR" });
+    }
+  });
+
+  // GET /api/routes/:id — route with stops, driver, computed fields
+  app.get("/api/routes/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const route = await storage.getRouteById(id);
+      if (!route) return res.status(404).json({ error: "Route not found", code: "NOT_FOUND" });
+
+      const [enriched, stops] = await Promise.all([
+        enrichRoute(route),
+        storage.getRouteStops(id),
+      ]);
+
+      let driver = null;
+      if (route.assignedDriverId) {
+        driver = await storage.getEmployeeById(route.assignedDriverId);
+      }
+
+      const { data: timeEntries } = route.assignedDriverId
+        ? await storage.getTimeEntries({ employeeId: route.assignedDriverId, dateFrom: route.date, dateTo: route.date, limit: 50 })
+        : { data: [] };
+
+      res.json({ data: { ...enriched, stops, driver, timeEntries } });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch route", code: "FETCH_ERROR" });
+    }
+  });
+
+  // PATCH /api/routes/:id — update route
+  app.patch("/api/routes/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const route = await storage.getRouteById(id);
+      if (!route) return res.status(404).json({ error: "Route not found", code: "NOT_FOUND" });
+      const { name, zone, assignedDriverId, date, estimatedHours, status, notes } = req.body;
+      const updates: Parameters<typeof storage.updateRoute>[1] = {};
+      if (name !== undefined) updates.name = name;
+      if (zone !== undefined) updates.zone = zone;
+      if (assignedDriverId !== undefined) updates.assignedDriverId = assignedDriverId ? parseInt(assignedDriverId) : null;
+      if (date !== undefined) updates.date = date;
+      if (estimatedHours !== undefined) updates.estimatedHours = parseFloat(estimatedHours).toFixed(2);
+      if (status !== undefined) updates.status = status;
+      if (notes !== undefined) updates.notes = notes;
+      const updated = await storage.updateRoute(id, updates);
+      res.json({ data: updated });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to update route", code: "UPDATE_ERROR" });
+    }
+  });
+
+  // POST /api/routes/:id/stops — add stop
+  app.post("/api/routes/:id/stops", async (req, res) => {
+    try {
+      const routeId = parseInt(req.params.id);
+      const route = await storage.getRouteById(routeId);
+      if (!route) return res.status(404).json({ error: "Route not found", code: "NOT_FOUND" });
+      const { sequence, customerName, address, serviceType, estimatedMinutes, lat, lng, notes } = req.body;
+      if (!customerName || !address || !estimatedMinutes) {
+        return res.status(400).json({ error: "customerName, address, and estimatedMinutes are required", code: "VALIDATION_ERROR" });
+      }
+      const stop = await storage.createRouteStop({
+        routeId,
+        sequence: sequence ?? (route.totalStops + 1),
+        customerName,
+        address,
+        serviceType: serviceType ?? "service",
+        estimatedMinutes: parseInt(estimatedMinutes),
+        lat: lat ? String(lat) : null,
+        lng: lng ? String(lng) : null,
+        notes: notes ?? null,
+        status: "pending",
+      });
+      // Increment totalStops on the route
+      await storage.updateRoute(routeId, { totalStops: route.totalStops + 1 });
+      res.status(201).json({ data: stop });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to add stop", code: "CREATE_ERROR" });
+    }
+  });
+
+  // PATCH /api/routes/:routeId/stops/:stopId — update stop
+  app.patch("/api/routes/:routeId/stops/:stopId", async (req, res) => {
+    try {
+      const stopId = parseInt(req.params.stopId);
+      const updates: Parameters<typeof storage.updateRouteStop>[1] = {};
+      const { sequence, customerName, address, serviceType, estimatedMinutes, lat, lng, notes, status } = req.body;
+      if (sequence !== undefined) updates.sequence = parseInt(sequence);
+      if (customerName !== undefined) updates.customerName = customerName;
+      if (address !== undefined) updates.address = address;
+      if (serviceType !== undefined) updates.serviceType = serviceType;
+      if (estimatedMinutes !== undefined) updates.estimatedMinutes = parseInt(estimatedMinutes);
+      if (lat !== undefined) updates.lat = lat ? String(lat) : null;
+      if (lng !== undefined) updates.lng = lng ? String(lng) : null;
+      if (notes !== undefined) updates.notes = notes;
+      if (status !== undefined) updates.status = status;
+      const updated = await storage.updateRouteStop(stopId, updates);
+      res.json({ data: updated });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to update stop", code: "UPDATE_ERROR" });
+    }
+  });
+
+  // PATCH /api/routes/:routeId/stops/:stopId/complete — mark stop completed
+  app.patch("/api/routes/:routeId/stops/:stopId/complete", async (req, res) => {
+    try {
+      const routeId = parseInt(req.params.routeId);
+      const stopId = parseInt(req.params.stopId);
+      const { actualMinutes, notes } = req.body;
+      const now = new Date().toISOString();
+
+      const updated = await storage.updateRouteStop(stopId, {
+        status: "completed",
+        completedAt: now,
+        durationMinutes: actualMinutes ? parseInt(actualMinutes) : undefined,
+        notes: notes ?? undefined,
+      });
+
+      // Increment completedStops on the route
+      const route = await storage.getRouteById(routeId);
+      if (route) {
+        const newCompleted = route.completedStops + 1;
+        const routeUpdates: Parameters<typeof storage.updateRoute>[1] = { completedStops: newCompleted };
+        // Auto-complete route if all stops done
+        if (newCompleted >= route.totalStops && route.totalStops > 0) {
+          routeUpdates.status = "completed";
+          routeUpdates.actualEndTime = now;
+        }
+        await storage.updateRoute(routeId, routeUpdates);
+      }
+
+      res.json({ data: updated });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to complete stop", code: "UPDATE_ERROR" });
     }
   });
 
